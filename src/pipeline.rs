@@ -6,6 +6,7 @@
 //! - **Extract** — unpack RAR, 7z, ZIP archives
 //! - **Cleanup** — remove archive/par2 files
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -15,6 +16,14 @@ use tracing::{debug, error, info, warn};
 use crate::detect::{ArchiveType, find_archives, find_cleanup_files, find_par2_files};
 use crate::par2::par2_repair;
 use crate::unpack::{extract_7z, extract_rar, extract_zip};
+
+fn increment_counter(name: &'static str) {
+    opentelemetry::global::meter_provider()
+        .meter("rustnzb")
+        .u64_counter(name)
+        .build()
+        .add(1, &[]);
+}
 
 /// Outcome of the combined verify+repair spawn_blocking task.
 /// Keeps VerifyResult (which is !Send) on the blocking thread, then returns
@@ -57,11 +66,17 @@ pub struct PostProcConfig {
     /// When > 0, `par2 repair` is run directly (which verifies + repairs
     /// in a single pass), avoiding the redundant verify-then-repair double-scan.
     pub articles_failed: usize,
+    /// Failed articles belonging to source/content files. PAR2 volume
+    /// failures do not make an otherwise intact archive unextractable.
+    pub content_articles_failed: usize,
     /// When true, the extract stage is skipped because direct unpack already
     /// handled RAR extraction during the download phase.
     pub skip_extract: bool,
     /// Optional archive password (from NZB metadata or indexer API).
     pub password: Option<String>,
+    /// Maximum archive nesting depth processed automatically. Zero permits
+    /// the outer archive only; the default handles five nested layers.
+    pub max_nested_archive_depth: u8,
 }
 
 impl Default for PostProcConfig {
@@ -70,8 +85,10 @@ impl Default for PostProcConfig {
             cleanup_after_extract: true,
             output_dir: None,
             articles_failed: 0,
+            content_articles_failed: 0,
             skip_extract: false,
             password: None,
+            max_nested_archive_depth: 5,
         }
     }
 }
@@ -102,13 +119,31 @@ pub async fn run_pipeline(job_dir: &Path, config: &PostProcConfig) -> PostProcRe
     // during yEnc decode, so we skip the expensive MD5 verification pass.
     let par2_files = find_par2_files(job_dir);
 
+    info!(
+        par2_files = par2_files.len(),
+        "PAR2 files discovered for post-processing"
+    );
+
     if par2_files.is_empty() {
-        stages.push(StageResult {
-            name: "Verify".to_string(),
-            status: StageStatus::Skipped,
-            message: Some("No par2 files found".to_string()),
-            duration_secs: 0.0,
-        });
+        if config.content_articles_failed > 0 {
+            pipeline_ok = false;
+            stages.push(StageResult {
+                name: "Verify".to_string(),
+                status: StageStatus::Failed,
+                message: Some(format!(
+                    "{} content article(s) missing and no PAR2 recovery set is available",
+                    config.content_articles_failed
+                )),
+                duration_secs: 0.0,
+            });
+        } else {
+            stages.push(StageResult {
+                name: "Verify".to_string(),
+                status: StageStatus::Skipped,
+                message: Some("No par2 files found".to_string()),
+                duration_secs: 0.0,
+            });
+        }
     } else if config.articles_failed == 0 {
         info!("Skipping PAR2 verification — zero article failures (CRC-verified)");
         stages.push(StageResult {
@@ -179,6 +214,7 @@ pub async fn run_pipeline(job_dir: &Path, config: &PostProcConfig) -> PostProcRe
 
                 match verify_repair_result {
                     Ok(VerifyRepairOutcome::AllCorrect { intact_count }) => {
+                        increment_counter("par2.verify_success");
                         info!(
                             files = intact_count,
                             duration_secs = verify_duration,
@@ -214,6 +250,11 @@ pub async fn run_pipeline(job_dir: &Path, config: &PostProcConfig) -> PostProcRe
                         // Push the repair stage result
                         match repair_result {
                             Ok(result) => {
+                                increment_counter(if result.success {
+                                    "par2.repair_success"
+                                } else {
+                                    "par2.repair_failure"
+                                });
                                 info!(
                                     blocks_repaired = result.blocks_repaired,
                                     files_repaired = result.files_repaired,
@@ -234,6 +275,7 @@ pub async fn run_pipeline(job_dir: &Path, config: &PostProcConfig) -> PostProcRe
                                 });
                             }
                             Err(e) => {
+                                increment_counter("par2.repair_failure");
                                 error!(
                                     error = %e,
                                     blocks_needed,
@@ -289,6 +331,11 @@ pub async fn run_pipeline(job_dir: &Path, config: &PostProcConfig) -> PostProcRe
                     });
 
                     let repair_result = run_repair_stage(job_dir).await;
+                    increment_counter(if repair_result.status == StageStatus::Failed {
+                        "par2.repair_failure"
+                    } else {
+                        "par2.repair_success"
+                    });
                     if repair_result.status == StageStatus::Failed {
                         pipeline_ok = false;
                     }
@@ -301,21 +348,30 @@ pub async fn run_pipeline(job_dir: &Path, config: &PostProcConfig) -> PostProcRe
     // ------------------------------------------------------------------
     // Stage 3: Extract
     // ------------------------------------------------------------------
-    // Attempt extraction even if verify/repair failed when only a few articles
-    // were missing — the failed articles may have been PAR2 files rather than
-    // data files, so the RAR archive could still be intact.
-    let should_extract = pipeline_ok || config.articles_failed <= 5;
-    if config.skip_extract {
-        info!("Skipping extraction — completed by direct unpack");
-        stages.push(StageResult {
-            name: "Extract".to_string(),
-            status: StageStatus::Skipped,
-            message: Some("Skipped — completed by direct unpack".to_string()),
-            duration_secs: 0.0,
-        });
-    } else if should_extract {
+    // Extraction is safe only after verification/repair succeeded (or source
+    // content was already known-good). Confirmed unrepaired content damage
+    // must not be mistaken for a successful archive.
+    let should_extract = pipeline_ok;
+    let mut extracted_archives = Vec::new();
+    if should_extract {
         let output_dir = config.output_dir.as_deref().unwrap_or(job_dir);
-        let result = run_extract_stage(job_dir, output_dir, config.password.as_deref()).await;
+        // Direct unpack has already extracted the outer archive, but its output
+        // can itself contain archives. Scan that directory so a nested archive
+        // cannot be silently left behind just because direct unpack was used.
+        let source_dir = if config.skip_extract {
+            info!("Outer extraction completed by direct unpack; checking for nested archives");
+            output_dir
+        } else {
+            job_dir
+        };
+        let (result, processed_archives) = run_extract_stage(
+            source_dir,
+            output_dir,
+            config.password.as_deref(),
+            config.max_nested_archive_depth,
+        )
+        .await;
+        extracted_archives = processed_archives;
         if result.status == StageStatus::Failed {
             pipeline_ok = false;
         } else if result.status == StageStatus::Success {
@@ -329,7 +385,7 @@ pub async fn run_pipeline(job_dir: &Path, config: &PostProcConfig) -> PostProcRe
     // Stage 4: Cleanup
     // ------------------------------------------------------------------
     if pipeline_ok && config.cleanup_after_extract {
-        let result = run_cleanup_stage(job_dir);
+        let result = run_cleanup_stage(job_dir, &extracted_archives);
         stages.push(result);
     }
 
@@ -495,68 +551,129 @@ async fn run_repair_stage(job_dir: &Path) -> StageResult {
 }
 
 async fn run_extract_stage(
-    job_dir: &Path,
+    source_dir: &Path,
     output_dir: &Path,
     password: Option<&str>,
-) -> StageResult {
+    max_nested_archive_depth: u8,
+) -> (StageResult, Vec<PathBuf>) {
     let start = Instant::now();
-    let archives = find_archives(job_dir);
-
-    if archives.is_empty() {
-        info!("No archives found — skipping extraction");
-        return StageResult {
-            name: "Extract".to_string(),
-            status: StageStatus::Skipped,
-            message: Some("No archives found".to_string()),
-            duration_secs: start.elapsed().as_secs_f64(),
-        };
-    }
-
     let mut all_ok = true;
     let mut messages: Vec<String> = Vec::new();
+    // The completed directory can pre-exist (for example a category
+    // directory). Do not recurse into archives that were already there before
+    // this job extracted anything. Direct unpack writes to a job-specific
+    // output directory, so its initial archives are the intended input.
+    let mut processed: HashSet<PathBuf> = if source_dir == output_dir {
+        HashSet::new()
+    } else {
+        find_archives(output_dir)
+            .into_iter()
+            .map(|(_, path)| path)
+            .collect()
+    };
+    let mut extracted_archives = Vec::new();
+    let mut scan_dir = source_dir;
+    let mut extracted_any = false;
 
-    for (archive_type, path) in &archives {
-        info!(kind = %archive_type, file = %path.display(), "Extracting archive");
+    for depth in 0..=max_nested_archive_depth {
+        let archives: Vec<_> = find_archives(scan_dir)
+            .into_iter()
+            .filter(|(_, path)| processed.insert(path.clone()))
+            .collect();
+        if archives.is_empty() {
+            break;
+        }
 
-        let result = match archive_type {
-            ArchiveType::Rar => extract_rar(path, output_dir, password).await,
-            ArchiveType::SevenZip => extract_7z(path, output_dir, password).await,
-            ArchiveType::Zip => extract_zip(path, output_dir).await,
-        };
+        extracted_any = true;
+        extracted_archives.extend(archives.iter().map(|(_, path)| path.clone()));
+        for (archive_type, path) in &archives {
+            info!(depth, kind = %archive_type, file = %path.display(), "Extracting archive");
+            let result = match archive_type {
+                ArchiveType::Rar => extract_rar(path, output_dir, password).await,
+                ArchiveType::SevenZip => extract_7z(path, output_dir, password).await,
+                ArchiveType::Zip => extract_zip(path, output_dir).await,
+            };
 
-        match result {
-            Ok(unpack_result) => {
-                if unpack_result.success {
-                    messages.push(format!("{archive_type}: OK"));
-                } else {
+            match result {
+                Ok(unpack_result) if unpack_result.success => {
+                    messages.push(format!("depth {depth} {archive_type}: OK"));
+                }
+                Ok(unpack_result) => {
                     all_ok = false;
-                    warn!(kind = %archive_type, file = %path.display(), "Extraction reported failure");
-                    messages.push(format!("{archive_type}: failed"));
+                    let detail = unpack_result
+                        .error_output
+                        .trim()
+                        .lines()
+                        .find(|line| !line.trim().is_empty());
+                    messages.push(match detail {
+                        Some(detail) => format!("depth {depth} {archive_type}: failed ({detail})"),
+                        None => format!("depth {depth} {archive_type}: failed"),
+                    });
+                }
+                Err(e) => {
+                    all_ok = false;
+                    error!(depth, kind = %archive_type, file = %path.display(), error = %e, "Extraction error");
+                    messages.push(format!("depth {depth} {archive_type}: {e}"));
                 }
             }
-            Err(e) => {
-                all_ok = false;
-                error!(kind = %archive_type, file = %path.display(), error = %e, "Extraction error");
-                messages.push(format!("{archive_type}: {e}"));
-            }
         }
+
+        if !all_ok {
+            break;
+        }
+        scan_dir = output_dir;
     }
 
-    StageResult {
-        name: "Extract".to_string(),
-        status: if all_ok {
-            StageStatus::Success
-        } else {
-            StageStatus::Failed
-        },
-        message: Some(messages.join("; ")),
-        duration_secs: start.elapsed().as_secs_f64(),
+    if all_ok
+        && !find_archives(scan_dir)
+            .into_iter()
+            .all(|(_, path)| processed.contains(&path))
+    {
+        all_ok = false;
+        messages.push(format!(
+            "nested archive depth limit ({max_nested_archive_depth}) reached; source files retained"
+        ));
     }
+
+    if !extracted_any {
+        info!("No archives found — skipping extraction");
+        return (
+            StageResult {
+                name: "Extract".to_string(),
+                status: StageStatus::Skipped,
+                message: Some("No archives found".to_string()),
+                duration_secs: start.elapsed().as_secs_f64(),
+            },
+            Vec::new(),
+        );
+    }
+
+    (
+        StageResult {
+            name: "Extract".to_string(),
+            status: if all_ok {
+                StageStatus::Success
+            } else {
+                StageStatus::Failed
+            },
+            message: Some(messages.join("; ")),
+            duration_secs: start.elapsed().as_secs_f64(),
+        },
+        extracted_archives,
+    )
 }
 
-fn run_cleanup_stage(job_dir: &Path) -> StageResult {
+fn run_cleanup_stage(job_dir: &Path, extracted_archives: &[PathBuf]) -> StageResult {
     let start = Instant::now();
-    let files = find_cleanup_files(job_dir);
+    let mut files = find_cleanup_files(job_dir);
+    files.extend(
+        extracted_archives
+            .iter()
+            .filter(|path| path.is_file())
+            .cloned(),
+    );
+    files.sort();
+    files.dedup();
 
     if files.is_empty() {
         return StageResult {
@@ -604,6 +721,7 @@ fn run_cleanup_stage(job_dir: &Path) -> StageResult {
 mod tests {
     use super::*;
     use std::fs;
+    use std::io::Write;
 
     fn make_test_dir(files: &[&str]) -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
@@ -684,7 +802,7 @@ mod tests {
             "movie.mkv", // should NOT be removed
         ]);
 
-        let result = run_cleanup_stage(dir.path());
+        let result = run_cleanup_stage(dir.path(), &[]);
         assert_eq!(result.status, StageStatus::Success);
 
         // movie.mkv should still exist
@@ -694,6 +812,124 @@ mod tests {
         assert!(!dir.path().join("movie.vol00+01.par2").exists());
         assert!(!dir.path().join("movie.rar").exists());
         assert!(!dir.path().join("movie.r00").exists());
+    }
+
+    fn write_zip(path: &Path, entries: &[(&str, &[u8])]) {
+        let file = fs::File::create(path).unwrap();
+        let mut writer = zip::ZipWriter::new(file);
+        for (name, contents) in entries {
+            writer
+                .start_file(*name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            writer.write_all(contents).unwrap();
+        }
+        writer.finish().unwrap();
+    }
+
+    #[tokio::test]
+    async fn nested_zip_archives_are_extracted_recursively() {
+        let source = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        let inner = source.path().join("inner.zip");
+        write_zip(&inner, &[("payload.txt", b"nested payload")]);
+        let outer = source.path().join("outer.zip");
+        write_zip(&outer, &[("inner.zip", &fs::read(&inner).unwrap())]);
+        fs::remove_file(inner).unwrap();
+
+        let (result, _) = run_extract_stage(source.path(), output.path(), None, 1).await;
+
+        assert_eq!(result.status, StageStatus::Success, "{result:?}");
+        assert_eq!(
+            fs::read(output.path().join("payload.txt")).unwrap(),
+            b"nested payload"
+        );
+    }
+
+    #[tokio::test]
+    async fn nested_archive_depth_limit_fails_without_discarding_inner_archive() {
+        let source = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        let inner = source.path().join("inner.zip");
+        write_zip(&inner, &[("payload.txt", b"nested payload")]);
+        let outer = source.path().join("outer.zip");
+        write_zip(&outer, &[("inner.zip", &fs::read(&inner).unwrap())]);
+        fs::remove_file(inner).unwrap();
+
+        let (result, _) = run_extract_stage(source.path(), output.path(), None, 0).await;
+
+        assert_eq!(result.status, StageStatus::Failed, "{result:?}");
+        assert!(output.path().join("inner.zip").exists());
+        assert!(!output.path().join("payload.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn recursive_cleanup_removes_nested_archives_from_output_directory() {
+        let source = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        let inner = source.path().join("inner.zip");
+        write_zip(&inner, &[("payload.txt", b"nested payload")]);
+        let outer = source.path().join("outer.zip");
+        write_zip(&outer, &[("inner.zip", &fs::read(&inner).unwrap())]);
+        fs::remove_file(inner).unwrap();
+
+        let config = PostProcConfig {
+            output_dir: Some(output.path().to_path_buf()),
+            ..Default::default()
+        };
+        let result = run_pipeline(source.path(), &config).await;
+
+        assert!(result.success, "{result:?}");
+        assert_eq!(
+            fs::read(output.path().join("payload.txt")).unwrap(),
+            b"nested payload"
+        );
+        assert!(!output.path().join("inner.zip").exists());
+        assert!(!source.path().join("outer.zip").exists());
+    }
+
+    #[tokio::test]
+    async fn cleanup_keeps_unrelated_archives_in_the_output_directory() {
+        let source = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        let inner = source.path().join("inner.zip");
+        write_zip(&inner, &[("payload.txt", b"nested payload")]);
+        let outer = source.path().join("outer.zip");
+        write_zip(&outer, &[("inner.zip", &fs::read(&inner).unwrap())]);
+        fs::remove_file(inner).unwrap();
+        let unrelated = output.path().join("keep-me.zip");
+        write_zip(&unrelated, &[("unrelated.txt", b"keep")]);
+
+        let config = PostProcConfig {
+            output_dir: Some(output.path().to_path_buf()),
+            ..Default::default()
+        };
+        let result = run_pipeline(source.path(), &config).await;
+
+        assert!(result.success, "{result:?}");
+        assert!(unrelated.exists());
+        assert!(!output.path().join("inner.zip").exists());
+    }
+
+    #[tokio::test]
+    async fn direct_unpack_still_extracts_nested_archives() {
+        let job_dir = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        let nested = output.path().join("nested.zip");
+        write_zip(&nested, &[("payload.txt", b"nested payload")]);
+
+        let config = PostProcConfig {
+            output_dir: Some(output.path().to_path_buf()),
+            skip_extract: true,
+            ..Default::default()
+        };
+        let result = run_pipeline(job_dir.path(), &config).await;
+
+        assert!(result.success, "{result:?}");
+        assert_eq!(
+            fs::read(output.path().join("payload.txt")).unwrap(),
+            b"nested payload"
+        );
+        assert!(!nested.exists());
     }
 
     #[tokio::test]
@@ -753,31 +989,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_pipeline_no_par2_files_skips_regardless() {
-        // No par2 files — should skip even if articles_failed > 0
+    async fn test_pipeline_no_par2_with_content_failures_is_terminal() {
+        // Confirmed source damage without PAR2 cannot be repaired and must
+        // not continue into extraction.
         let dir = make_test_dir(&["movie.mkv"]);
         let config = PostProcConfig {
             cleanup_after_extract: false,
             articles_failed: 5,
+            content_articles_failed: 5,
             ..Default::default()
         };
         let result = run_pipeline(dir.path(), &config).await;
-        assert!(result.success);
+        assert!(!result.success);
 
         let verify_stage = result.stages.iter().find(|s| s.name == "Verify").unwrap();
         assert_eq!(
             verify_stage.status,
-            StageStatus::Skipped,
-            "Verify should be skipped when no par2 files exist"
+            StageStatus::Failed,
+            "No-PAR content damage is unrecoverable"
         );
         assert!(
             verify_stage
                 .message
                 .as_deref()
                 .unwrap_or("")
-                .contains("No par2 files"),
-            "Skip message should indicate no par2 files"
+                .contains("no PAR2 recovery set"),
+            "Failure should explain that recovery data is unavailable"
         );
+        assert!(result.stages.iter().all(|stage| stage.name != "Extract"));
     }
 
     #[tokio::test]
@@ -816,6 +1055,7 @@ mod tests {
     fn make_par2_file_set(tmp: &Path, files: &[(&str, &[u8])]) -> rust_par2::Par2FileSet {
         use rust_par2::{Par2File, Par2FileSet};
         let mut map = std::collections::HashMap::new();
+        let mut file_order = Vec::with_capacity(files.len());
         for (i, (name, content)) in files.iter().enumerate() {
             // Write to temp file so we can use compute_hash_16k
             let tmp_path = tmp.join(format!("_par2_tmp_{i}"));
@@ -824,6 +1064,7 @@ mod tests {
             let _ = fs::remove_file(&tmp_path);
 
             let file_id = [i as u8; 16];
+            file_order.push(file_id);
             map.insert(
                 file_id,
                 Par2File {
@@ -839,6 +1080,7 @@ mod tests {
         Par2FileSet {
             recovery_set_id: [0u8; 16],
             slice_size: 16384,
+            file_order,
             files: map,
             recovery_block_count: 0,
             creator: None,
