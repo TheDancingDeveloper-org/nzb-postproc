@@ -96,7 +96,7 @@ impl std::fmt::Display for ArchiveType {
 }
 
 /// Find all `.par2` files in a directory. The index par2 file (without
-/// `.volNNN+NNN.par2` suffix) is returned first so callers can use it
+/// `.volNNN+NNN.par2` or `.volNNN-NNN.par2` suffix) is returned first so callers can use it
 /// as the primary verification target.
 pub fn find_par2_files(dir: &Path) -> Vec<PathBuf> {
     let mut index_files: Vec<PathBuf> = Vec::new();
@@ -131,22 +131,22 @@ pub fn find_par2_files(dir: &Path) -> Vec<PathBuf> {
 }
 
 /// Returns true if a filename looks like a par2 volume file (e.g.
-/// `foo.vol00+01.par2`) rather than the index file (`foo.par2`).
+/// `foo.vol00+01.par2` or `foo.vol00-01.par2`) rather than the index file.
 fn is_par2_volume(name_lower: &str) -> bool {
-    // Typical pattern: .vol000+000.par2
+    // Typical patterns: .vol000+000.par2 and .vol000-000.par2.
     // We check for ".vol" anywhere before the final ".par2"
     let without_ext = name_lower.trim_end_matches(".par2");
     // Look for ".vol" followed by digits, a '+', and more digits
     if let Some(vol_pos) = without_ext.rfind(".vol") {
         let after_vol = &without_ext[vol_pos + 4..];
         // Check pattern: digits + '+' + digits
-        if let Some(plus_pos) = after_vol.find('+') {
-            let before_plus = &after_vol[..plus_pos];
-            let after_plus = &after_vol[plus_pos + 1..];
-            return !before_plus.is_empty()
-                && before_plus.chars().all(|c| c.is_ascii_digit())
-                && !after_plus.is_empty()
-                && after_plus.chars().all(|c| c.is_ascii_digit());
+        if let Some(separator_pos) = after_vol.find(['+', '-']) {
+            let before_separator = &after_vol[..separator_pos];
+            let after_separator = &after_vol[separator_pos + 1..];
+            return !before_separator.is_empty()
+                && before_separator.chars().all(|c| c.is_ascii_digit())
+                && !after_separator.is_empty()
+                && after_separator.chars().all(|c| c.is_ascii_digit());
         }
     }
     false
@@ -260,6 +260,29 @@ pub fn find_cleanup_files(dir: &Path) -> Vec<PathBuf> {
     cleanup
 }
 
+/// Returns whether a completed output directory contains at least one file
+/// that is not an archive or PAR2 recovery artifact. This is deliberately a
+/// conservative final-status check: a job made solely of raw recovery and
+/// archive files is not a usable completed download.
+pub fn has_usable_output(dir: &Path) -> std::io::Result<bool> {
+    for entry in WalkDir::new(dir).into_iter().flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !is_cleanup_candidate(&name.to_ascii_lowercase()) {
+            return Ok(true);
+        }
+    }
+
+    // Distinguish an empty, readable output directory from a missing one.
+    std::fs::read_dir(dir)?;
+    Ok(false)
+}
+
 /// Returns true if a lowercased filename is the first volume of a split 7z
 /// archive (e.g., `archive.7z.001`).
 fn is_split_7z_first_volume(name_lower: &str) -> bool {
@@ -288,7 +311,7 @@ fn is_split_7z_volume(name_lower: &str) -> bool {
 /// after successful extraction.
 fn is_cleanup_candidate(name: &str) -> bool {
     // Par2 files: .par2
-    if name.ends_with(".par2") {
+    if name.ends_with(".par2") || name.ends_with(".zip") || name.ends_with(".7z") {
         return true;
     }
 
@@ -363,6 +386,14 @@ mod tests {
     }
 
     #[test]
+    fn test_find_par2_hyphenated_volumes_after_index() {
+        let dir = make_test_dir(&["movie.vol63-67.par2", "movie.par2", "movie.vol00-01.par2"]);
+        let files = find_par2_files(dir.path());
+        assert_eq!(files[0].file_name().unwrap(), "movie.par2");
+        assert_eq!(files.len(), 3);
+    }
+
+    #[test]
     fn test_find_par2_empty_dir() {
         let dir = make_test_dir(&["readme.txt", "movie.mkv"]);
         let results = find_par2_files(dir.path());
@@ -423,6 +454,21 @@ mod tests {
     }
 
     #[test]
+    fn usable_output_requires_a_non_artifact_file() {
+        let raw_only = make_test_dir(&[
+            "release.part001.rar",
+            "release.part002.rar",
+            "release.par2",
+            "release.vol00+01.par2",
+            "release.7z",
+        ]);
+        assert!(!has_usable_output(raw_only.path()).unwrap());
+
+        let payload = make_test_dir(&["release.part001.rar", "Movie.2024.mkv"]);
+        assert!(has_usable_output(payload.path()).unwrap());
+    }
+
+    #[test]
     fn test_find_cleanup_files() {
         let dir = make_test_dir(&[
             "movie.par2",
@@ -439,8 +485,7 @@ mod tests {
         assert_eq!(
             results.len(),
             6,
-            "Expected 6 cleanup files, got: {:?}",
-            results
+            "Expected 6 cleanup files, got: {results:?}"
         );
         // .mkv and .txt should NOT be present
         for path in &results {
@@ -454,6 +499,8 @@ mod tests {
     fn test_is_par2_volume() {
         assert!(is_par2_volume("file.vol00+01.par2"));
         assert!(is_par2_volume("file.vol123+456.par2"));
+        assert!(is_par2_volume("file.vol00-01.par2"));
+        assert!(is_par2_volume("file.vol63-67.par2"));
         assert!(!is_par2_volume("file.par2"));
         assert!(!is_par2_volume("file.volume.par2"));
     }
@@ -511,6 +558,7 @@ mod tests {
 
     #[test]
     fn test_cleanup_split_7z_volumes() {
+        assert!(is_cleanup_candidate("archive.7z"));
         assert!(is_cleanup_candidate("archive.7z.001"));
         assert!(is_cleanup_candidate("archive.7z.002"));
         assert!(is_cleanup_candidate("archive.7z.099"));
@@ -529,8 +577,7 @@ mod tests {
         assert_eq!(
             results.len(),
             3,
-            "Expected 3 split 7z cleanup files, got: {:?}",
-            results
+            "Expected 3 split 7z cleanup files, got: {results:?}"
         );
         for path in &results {
             let name = path.file_name().unwrap().to_str().unwrap();
