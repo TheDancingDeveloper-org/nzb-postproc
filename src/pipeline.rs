@@ -8,6 +8,7 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Instant;
 
 use nzb_core::models::{StageResult, StageStatus};
@@ -15,7 +16,8 @@ use tracing::{debug, error, info, warn};
 
 use crate::detect::{ArchiveType, find_archives, find_cleanup_files, find_par2_files};
 use crate::par2::par2_repair;
-use crate::unpack::{extract_7z, extract_rar, extract_zip};
+use crate::resources::PostProcResourcePool;
+use crate::unpack::{extract_7z, extract_rar, extract_tar, extract_zip};
 
 fn increment_counter(name: &'static str) {
     opentelemetry::global::meter_provider()
@@ -101,6 +103,30 @@ impl Default for PostProcConfig {
 /// 3. **Extract** — unpack RAR, 7z, ZIP archives
 /// 4. **Cleanup** — remove archive/par2 files (if configured)
 pub async fn run_pipeline(job_dir: &Path, config: &PostProcConfig) -> PostProcResult {
+    run_pipeline_with_resources(job_dir, config, None).await
+}
+
+/// Run the pipeline under optional shared stage-specific resource gates.
+///
+/// This additive entry point keeps [`PostProcConfig`] source-compatible for
+/// library consumers while allowing applications to coordinate independent
+/// jobs through one [`PostProcResourcePool`].
+pub async fn run_pipeline_with_resources(
+    job_dir: &Path,
+    config: &PostProcConfig,
+    resources: Option<&Arc<PostProcResourcePool>>,
+) -> PostProcResult {
+    run_pipeline_with_cleanup(job_dir, config, resources, &[], &[]).await
+}
+
+/// Run the pipeline with optional category cleanup rules.
+pub async fn run_pipeline_with_cleanup(
+    job_dir: &Path,
+    config: &PostProcConfig,
+    resources: Option<&Arc<PostProcResourcePool>>,
+    cleanup_patterns: &[String],
+    unwanted_extensions: &[String],
+) -> PostProcResult {
     let mut stages: Vec<StageResult> = Vec::new();
     let mut pipeline_ok = true;
 
@@ -145,15 +171,42 @@ pub async fn run_pipeline(job_dir: &Path, config: &PostProcConfig) -> PostProcRe
             });
         }
     } else if config.articles_failed == 0 {
+        // Files are known-good from CRC checks during yEnc decode, so the
+        // expensive MD5 verification pass is skipped.
+        //
+        // PAR2-guided deobfuscation still has to run. Obfuscated posts arrive
+        // with meaningless filenames whether or not an article failed, and the
+        // PAR2 metadata is the only record of the real names. While this
+        // rename lived inside the verify branch below, a *clean* download of
+        // an obfuscated post was never deobfuscated: no archive was found, the
+        // Extract stage reported "No archives found", and the job completed
+        // with raw volumes on disk. A damaged download self-healed; a healthy
+        // one did not (issue #87).
         info!("Skipping PAR2 verification — zero article failures (CRC-verified)");
+        let start = Instant::now();
+        let message = match rust_par2::parse(&par2_files[0]) {
+            Ok(file_set) => {
+                rename_to_par2_names(&file_set, job_dir);
+                "Skipped — zero article failures (PAR2-guided rename applied)".to_string()
+            }
+            Err(e) => {
+                debug!(error = %e, "PAR2 parse failed; skipping PAR2-guided deobfuscation");
+                format!("Skipped — zero article failures (PAR2 parse failed: {e})")
+            }
+        };
         stages.push(StageResult {
             name: "Verify".to_string(),
             status: StageStatus::Skipped,
-            message: Some("Skipped — zero article failures".to_string()),
-            duration_secs: 0.0,
+            message: Some(message),
+            duration_secs: start.elapsed().as_secs_f64(),
         });
     } else {
         let verify_start = Instant::now();
+        let _repair_permit = if let Some(resources) = resources {
+            Some(resources.acquire_repair().await)
+        } else {
+            None
+        };
         let index_par2 = par2_files[0].clone();
 
         match rust_par2::parse(&index_par2) {
@@ -162,7 +215,9 @@ pub async fn run_pipeline(job_dir: &Path, config: &PostProcConfig) -> PostProcRe
                 // PAR2 expected names (common with obfuscated posts where
                 // NZB subjects have readable names but PAR2 references
                 // the original obfuscated filenames), rename them using
-                // MD5-16k hash matching before verification runs.
+                // MD5-16k hash matching before verification runs. The
+                // zero-failure branch above runs this too — verification is
+                // skipped there, but deobfuscation must not be.
                 rename_to_par2_names(&file_set, job_dir);
 
                 // Run verify (and repair if needed) in a single spawn_blocking call.
@@ -364,6 +419,11 @@ pub async fn run_pipeline(job_dir: &Path, config: &PostProcConfig) -> PostProcRe
         } else {
             job_dir
         };
+        let _extract_permit = if let Some(resources) = resources {
+            Some(resources.acquire_extract().await)
+        } else {
+            None
+        };
         let (result, processed_archives) = run_extract_stage(
             source_dir,
             output_dir,
@@ -385,7 +445,14 @@ pub async fn run_pipeline(job_dir: &Path, config: &PostProcConfig) -> PostProcRe
     // Stage 4: Cleanup
     // ------------------------------------------------------------------
     if pipeline_ok && config.cleanup_after_extract {
-        let result = run_cleanup_stage(job_dir, &extracted_archives);
+        let cleanup_root = config.output_dir.as_deref().unwrap_or(job_dir);
+        let result = run_cleanup_stage_with_rules(
+            job_dir,
+            cleanup_root,
+            &extracted_archives,
+            cleanup_patterns,
+            unwanted_extensions,
+        );
         stages.push(result);
     }
 
@@ -591,6 +658,7 @@ async fn run_extract_stage(
             let result = match archive_type {
                 ArchiveType::Rar => extract_rar(path, output_dir, password).await,
                 ArchiveType::SevenZip => extract_7z(path, output_dir, password).await,
+                ArchiveType::Tar => extract_tar(path, output_dir).await,
                 ArchiveType::Zip => extract_zip(path, output_dir).await,
             };
 
@@ -663,15 +731,108 @@ async fn run_extract_stage(
     )
 }
 
+#[cfg(test)]
 fn run_cleanup_stage(job_dir: &Path, extracted_archives: &[PathBuf]) -> StageResult {
+    run_cleanup_stage_with_rules(job_dir, job_dir, extracted_archives, &[], &[])
+}
+
+fn wildcard_match(pattern: &str, value: &str) -> bool {
+    let (mut pattern_index, mut value_index) = (0usize, 0usize);
+    let mut star = None;
+    let mut star_value = 0usize;
+    let pattern = pattern.as_bytes();
+    let value = value.as_bytes();
+
+    while value_index < value.len() {
+        if pattern_index < pattern.len()
+            && (pattern[pattern_index] == value[value_index] || pattern[pattern_index] == b'?')
+        {
+            pattern_index += 1;
+            value_index += 1;
+        } else if pattern_index < pattern.len() && pattern[pattern_index] == b'*' {
+            star = Some(pattern_index);
+            pattern_index += 1;
+            star_value = value_index;
+        } else if let Some(star_index) = star {
+            pattern_index = star_index + 1;
+            star_value += 1;
+            value_index = star_value;
+        } else {
+            return false;
+        }
+    }
+    while pattern_index < pattern.len() && pattern[pattern_index] == b'*' {
+        pattern_index += 1;
+    }
+    pattern_index == pattern.len()
+}
+
+fn run_cleanup_stage_with_rules(
+    job_dir: &Path,
+    cleanup_root: &Path,
+    extracted_archives: &[PathBuf],
+    cleanup_patterns: &[String],
+    unwanted_extensions: &[String],
+) -> StageResult {
     let start = Instant::now();
     let mut files = find_cleanup_files(job_dir);
     files.extend(
         extracted_archives
             .iter()
-            .filter(|path| path.is_file())
+            .filter(|path| {
+                std::fs::symlink_metadata(path)
+                    .map(|metadata| metadata.file_type().is_file())
+                    .unwrap_or(false)
+            })
             .cloned(),
     );
+
+    let normalized_extensions: Vec<String> = unwanted_extensions
+        .iter()
+        .map(|extension| {
+            let extension = extension.trim().to_ascii_lowercase();
+            if extension.starts_with('.') {
+                extension
+            } else {
+                format!(".{extension}")
+            }
+        })
+        .filter(|extension| extension.len() > 1)
+        .collect();
+    let patterns: Vec<String> = cleanup_patterns
+        .iter()
+        .map(|pattern| pattern.replace('\\', "/").to_ascii_lowercase())
+        .filter(|pattern| !pattern.is_empty())
+        .collect();
+    for root in [job_dir, cleanup_root] {
+        for entry in walkdir::WalkDir::new(root).into_iter().flatten() {
+            let path = entry.path();
+            let Ok(metadata) = std::fs::symlink_metadata(path) else {
+                continue;
+            };
+            if !metadata.file_type().is_file() {
+                continue;
+            }
+            let Ok(relative) = path.strip_prefix(root) else {
+                continue;
+            };
+            let relative = relative.to_string_lossy().replace('\\', "/");
+            let filename = path
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .unwrap_or_default();
+            if normalized_extensions
+                .iter()
+                .any(|extension| filename.to_ascii_lowercase().ends_with(extension))
+                || patterns.iter().any(|pattern| {
+                    wildcard_match(pattern, &relative.to_ascii_lowercase())
+                        || wildcard_match(pattern, &filename.to_ascii_lowercase())
+                })
+            {
+                files.push(path.to_path_buf());
+            }
+        }
+    }
     files.sort();
     files.dedup();
 
@@ -688,6 +849,15 @@ fn run_cleanup_stage(job_dir: &Path, extracted_archives: &[PathBuf]) -> StageRes
     let mut errors = 0u32;
 
     for path in &files {
+        let under_allowed_root = path.starts_with(job_dir) || path.starts_with(cleanup_root);
+        let is_regular_file = std::fs::symlink_metadata(path)
+            .map(|metadata| metadata.file_type().is_file())
+            .unwrap_or(false);
+        if !under_allowed_root || !is_regular_file {
+            warn!(file = %path.display(), "Skipping cleanup path outside job roots or through a link");
+            errors += 1;
+            continue;
+        }
         match std::fs::remove_file(path) {
             Ok(()) => {
                 removed += 1;
