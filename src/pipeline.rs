@@ -11,15 +11,18 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
-use nzb_core::models::{JobFailureCode, StageResult, StageStatus};
+use nzb_core::models::{JobFailureCode, SliceMapSummary, StageResult, StageStatus};
 use tracing::{debug, error, info, warn};
 
 use crate::detect::{
     ArchiveType, find_archives, find_cleanup_files, find_par2_files, is_par2_volume,
 };
+use crate::fold_repair::repair_from_fold;
+use crate::inflight::{VerifySource, map_fits, verify_set};
 use crate::par2::par2_repair;
 use crate::resources::PostProcResourcePool;
 use crate::unpack::{ArchivePasswordRequired, extract_7z, extract_rar, extract_tar, extract_zip};
+use nzb_decode::SharedFold;
 
 fn increment_counter(name: &'static str) {
     opentelemetry::global::meter_provider()
@@ -29,14 +32,34 @@ fn increment_counter(name: &'static str) {
         .add(1, &[]);
 }
 
+/// One observation of `rustnzb.stage.duration` for `stage`, in seconds. The
+/// histogram is built once; the global meter is a noop until `main` installs a
+/// provider, so this is safe to call from tests.
+fn record_stage(stage: &'static str, seconds: f64) {
+    use opentelemetry::KeyValue;
+    use opentelemetry::metrics::Histogram;
+    static H: std::sync::OnceLock<Histogram<f64>> = std::sync::OnceLock::new();
+    H.get_or_init(|| {
+        opentelemetry::global::meter("rustnzb")
+            .f64_histogram("rustnzb.stage.duration")
+            .with_unit("s")
+            .with_description("Wall or cumulative time per download stage")
+            .build()
+    })
+    .record(seconds, &[KeyValue::new("stage", stage)]);
+}
+
 /// Outcome of the combined verify+repair spawn_blocking task.
 /// Keeps VerifyResult (which is !Send) on the blocking thread, then returns
 /// only Send-safe data back to the async context.
 enum VerifyRepairOutcome {
     AllCorrect {
         intact_count: usize,
+        verify: VerifyNote,
     },
     Damaged {
+        verify: VerifyNote,
+        repair: RepairNote,
         intact: usize,
         damaged: usize,
         missing: usize,
@@ -72,13 +95,99 @@ fn parse_par2_sets(paths: &[PathBuf]) -> (Vec<rust_par2::Par2FileSet>, Vec<Strin
     (sets, errors)
 }
 
+/// How one recovery set was verified, for its stage result (WI-147).
+#[derive(Debug, Clone, Copy)]
+struct VerifyNote {
+    source: VerifySource,
+    bytes_skipped: u64,
+    seconds: f64,
+}
+
+impl VerifyNote {
+    /// Suffix for the Verify stage message, parsed by benchnzb:
+    /// `[verify: in-flight, 5368709120 bytes not re-read]`.
+    fn tag(&self) -> String {
+        format!(
+            " [verify: {}, {} bytes not re-read, {:.3}s]",
+            self.source.as_str(),
+            self.bytes_skipped,
+            self.seconds
+        )
+    }
+}
+
+/// How one recovery set was repaired, for its stage result (WI-148).
+#[derive(Debug, Clone)]
+struct RepairNote {
+    /// `fold` when solved from the in-flight fold, `disk` otherwise.
+    path: &'static str,
+    /// Why the fold was not used, when it was offered and refused.
+    fallback: Option<String>,
+    /// Intact slices read from disk by the repair itself.
+    slices_read: usize,
+    seconds: f64,
+}
+
+impl RepairNote {
+    /// Suffix for the Repair stage message, parsed by benchnzb:
+    /// `[repair: fold, 3 slices read, 0.012s]`.
+    fn tag(&self) -> String {
+        let fallback = self
+            .fallback
+            .as_ref()
+            .map(|r| format!(", fold refused: {r}"))
+            .unwrap_or_default();
+        format!(
+            " [repair: {}, {} slices read, {:.3}s{fallback}]",
+            self.path, self.slices_read, self.seconds
+        )
+    }
+}
+
+/// Pick the in-flight slice map for each set. The map carries no recovery set
+/// id, so it is matched by slice count, and only when exactly one set fits.
+fn maps_for_sets<'a>(
+    file_sets: &[rust_par2::Par2FileSet],
+    config: &'a PostProcConfig,
+) -> Vec<Option<&'a SliceMapSummary>> {
+    let map = config
+        .slice_map
+        .as_ref()
+        .filter(|_| config.trust_inflight_verify);
+    let fits: Vec<bool> = file_sets
+        .iter()
+        .map(|set| map.is_some_and(|m| map_fits(set, m)))
+        .collect();
+    let unique = fits.iter().filter(|f| **f).count() == 1;
+    fits.into_iter()
+        .map(|fit| if fit && unique { map } else { None })
+        .collect()
+}
+
 /// Verify one recovery set and, if it is damaged, attempt a native repair using
 /// the pre-computed verify result (no redundant second verification pass).
-fn verify_repair_set(file_set: &rust_par2::Par2FileSet, dir: &Path) -> VerifyRepairOutcome {
-    let verify_result = rust_par2::verify(file_set, dir);
+///
+/// With a slice map, files the map decides are not read (WI-147). The repair
+/// then skips its own re-verification pass too: the map came from per-slice
+/// MD5s, and a disk-verified set keeps the post-repair check.
+fn verify_repair_set(
+    file_set: &rust_par2::Par2FileSet,
+    dir: &Path,
+    map: Option<&SliceMapSummary>,
+    fold: Option<&SharedFold>,
+) -> VerifyRepairOutcome {
+    let started = Instant::now();
+    let set_verify = verify_set(file_set, dir, map);
+    let verify = VerifyNote {
+        source: set_verify.source,
+        bytes_skipped: set_verify.bytes_skipped,
+        seconds: started.elapsed().as_secs_f64(),
+    };
+    let verify_result = set_verify.result;
     if verify_result.all_correct() {
         return VerifyRepairOutcome::AllCorrect {
             intact_count: verify_result.intact.len(),
+            verify,
         };
     }
 
@@ -94,8 +203,73 @@ fn verify_repair_set(file_set: &rust_par2::Par2FileSet, dir: &Path) -> VerifyRep
         blocks_needed,
         "Native PAR2 verify: damage detected, attempting native repair"
     );
-    let repair_result = rust_par2::repair_from_verify(file_set, dir, &verify_result);
+    let started = Instant::now();
+    let mut fallback = None;
+    if let Some(fold) = fold
+        && blocks_needed <= blocks_available
+    {
+        match repair_from_fold(file_set, dir, &verify_result, fold) {
+            Ok(done) => {
+                // A disk-verified set keeps the post-repair check.
+                let checked = verify.source != VerifySource::Disk || {
+                    let after = rust_par2::verify(file_set, dir);
+                    after.all_correct()
+                };
+                if checked {
+                    return VerifyRepairOutcome::Damaged {
+                        verify,
+                        repair: RepairNote {
+                            path: "fold",
+                            fallback: None,
+                            slices_read: done.slices_read_at_solve,
+                            seconds: started.elapsed().as_secs_f64(),
+                        },
+                        intact,
+                        damaged,
+                        missing,
+                        blocks_needed,
+                        blocks_available,
+                        repair_result: Ok(rust_par2::RepairResult {
+                            success: true,
+                            blocks_repaired: done.blocks_repaired,
+                            files_repaired: done.files_repaired,
+                            message: format!(
+                                "All files repaired from the in-flight fold ({} blocks)",
+                                done.blocks_repaired
+                            ),
+                        }),
+                    };
+                }
+                warn!("Fold repair did not verify; repairing from disk");
+                fallback = Some("post-repair verify failed".to_string());
+            }
+            Err(e) => {
+                info!("In-flight repair fold not usable, repairing from disk: {e}");
+                fallback = Some(e.to_string());
+            }
+        }
+    }
+    let started = Instant::now();
+    let repair_result = if verify.source == VerifySource::Disk {
+        rust_par2::repair_from_verify(file_set, dir, &verify_result)
+    } else {
+        rust_par2::repair_from_verify_no_reverify(file_set, dir, &verify_result)
+    };
+    let repair = RepairNote {
+        path: "disk",
+        fallback,
+        // The disk path reads every intact slice of the set.
+        slices_read: file_set
+            .files
+            .values()
+            .map(|f| f.size.div_ceil(file_set.slice_size.max(1)) as usize)
+            .sum::<usize>()
+            .saturating_sub(blocks_needed as usize),
+        seconds: started.elapsed().as_secs_f64(),
+    };
     VerifyRepairOutcome::Damaged {
+        verify,
+        repair,
         intact,
         damaged,
         missing,
@@ -103,6 +277,23 @@ fn verify_repair_set(file_set: &rust_par2::Par2FileSet, dir: &Path) -> VerifyRep
         blocks_available,
         repair_result,
     }
+}
+
+/// Count a set's verify source and the data bytes it did not re-read.
+fn record_verify(note: &VerifyNote) {
+    let meter = opentelemetry::global::meter_provider().meter("rustnzb");
+    let source = opentelemetry::KeyValue::new("source", note.source.as_str());
+    meter
+        .u64_counter("rustnzb.par2.verify_sets")
+        .with_description("PAR2 recovery sets verified, by where the verdicts came from")
+        .build()
+        .add(1, std::slice::from_ref(&source));
+    meter
+        .u64_counter("rustnzb.par2.verify_bytes_skipped")
+        .with_unit("By")
+        .with_description("Data-file bytes the in-flight slice map spared the verify pass")
+        .build()
+        .add(note.bytes_skipped, &[source]);
 }
 
 /// Final result of the complete post-processing pipeline.
@@ -147,6 +338,15 @@ pub struct PostProcConfig {
     /// Maximum archive nesting depth processed automatically. Zero permits
     /// the outer archive only; the default handles five nested layers.
     pub max_nested_archive_depth: u8,
+    /// In-flight PAR2 slice verdicts from the download (WI-147). When set and
+    /// trusted, files it fully decides are not re-read to verify.
+    pub slice_map: Option<SliceMapSummary>,
+    /// `par2.trust_inflight_verify`: false forces the full disk verify pass
+    /// even when a slice map is present.
+    pub trust_inflight_verify: bool,
+    /// The download's in-flight repair fold (WI-148). Used for the set the
+    /// slice map was matched to; any shortfall falls back to disk repair.
+    pub repair_fold: Option<SharedFold>,
 }
 
 impl Default for PostProcConfig {
@@ -160,6 +360,9 @@ impl Default for PostProcConfig {
             skip_extract: false,
             password: None,
             max_nested_archive_depth: 5,
+            slice_map: None,
+            trust_inflight_verify: true,
+            repair_fold: None,
         }
     }
 }
@@ -357,25 +560,42 @@ async fn run_stages(
             }
             let recovery_set_count = file_sets.len();
             let dir = job_dir.to_path_buf();
+            let maps: Vec<Option<SliceMapSummary>> = maps_for_sets(&file_sets, config)
+                .into_iter()
+                .map(|m| m.cloned())
+                .collect();
+            let fold = config.repair_fold.clone();
             // Verify (and repair when needed) every set in a single
             // spawn_blocking call. This keeps CPU-intensive work off the async
             // runtime and keeps each non-Send VerifyResult on one thread so the
             // repair can reuse it — no redundant second verification pass.
-            let outcomes = tokio::task::spawn_blocking(move || {
-                file_sets
-                    .iter()
-                    .map(|file_set| verify_repair_set(file_set, &dir))
-                    .collect::<Vec<_>>()
-            })
+            let outcomes = tracing::Instrument::instrument(
+                tokio::task::spawn_blocking(move || {
+                    file_sets
+                        .iter()
+                        .zip(&maps)
+                        .map(|(file_set, map)| {
+                            let fold = map.as_ref().and(fold.as_ref());
+                            verify_repair_set(file_set, &dir, map.as_ref(), fold)
+                        })
+                        .collect::<Vec<_>>()
+                }),
+                tracing::info_span!("par2_verify", recovery_sets = recovery_set_count),
+            )
             .await;
             let duration = started.elapsed().as_secs_f64();
+            record_stage("par2_verify", duration);
 
             match outcomes {
                 Ok(outcomes) => {
                     for (index, outcome) in outcomes.into_iter().enumerate() {
                         let set_number = index + 1;
                         match outcome {
-                            VerifyRepairOutcome::AllCorrect { intact_count } => {
+                            VerifyRepairOutcome::AllCorrect {
+                                intact_count,
+                                verify,
+                            } => {
+                                record_verify(&verify);
                                 increment_counter("par2.verify_success");
                                 info!(
                                     set_number,
@@ -387,12 +607,15 @@ async fn run_stages(
                                     name: "Verify".to_string(),
                                     status: StageStatus::Success,
                                     message: Some(format!(
-                                        "Recovery set {set_number}/{recovery_set_count}: all {intact_count} files correct"
+                                        "Recovery set {set_number}/{recovery_set_count}: all {intact_count} files correct{}",
+                                        verify.tag()
                                     )),
                                     duration_secs: duration,
                                 });
                             }
                             VerifyRepairOutcome::Damaged {
+                                verify,
+                                repair,
                                 intact,
                                 damaged,
                                 missing,
@@ -400,11 +623,13 @@ async fn run_stages(
                                 blocks_available,
                                 repair_result,
                             } => {
+                                record_verify(&verify);
                                 stages.push(StageResult {
                                     name: "Verify".to_string(),
                                     status: StageStatus::Success,
                                     message: Some(format!(
-                                        "Recovery set {set_number}/{recovery_set_count}: {intact} intact, {damaged} damaged, {missing} missing — {blocks_needed} blocks needed"
+                                        "Recovery set {set_number}/{recovery_set_count}: {intact} intact, {damaged} damaged, {missing} missing — {blocks_needed} blocks needed{}",
+                                        verify.tag()
                                     )),
                                     duration_secs: duration,
                                 });
@@ -434,8 +659,9 @@ async fn run_stages(
                                                 StageStatus::Failed
                                             },
                                             message: Some(format!(
-                                                "Recovery set {set_number}/{recovery_set_count}: {}",
-                                                result.message
+                                                "Recovery set {set_number}/{recovery_set_count}: {}{}",
+                                                result.message,
+                                                repair.tag()
                                             )),
                                             duration_secs: duration,
                                         });
@@ -458,7 +684,8 @@ async fn run_stages(
                                             name: "Repair".to_string(),
                                             status: StageStatus::Failed,
                                             message: Some(format!(
-                                                "Recovery set {set_number}/{recovery_set_count}: repair failed: {e}"
+                                                "Recovery set {set_number}/{recovery_set_count}: repair failed: {e}{}",
+                                                repair.tag()
                                             )),
                                             duration_secs: duration,
                                         });
@@ -518,12 +745,15 @@ async fn run_stages(
         } else {
             None
         };
-        let (result, processed_archives, extract_failure_code) = run_extract_stage(
-            source_dir,
-            job_dir_archives,
-            output_dir,
-            config.password.as_deref(),
-            config.max_nested_archive_depth,
+        let (result, processed_archives, extract_failure_code) = tracing::Instrument::instrument(
+            run_extract_stage(
+                source_dir,
+                job_dir_archives,
+                output_dir,
+                config.password.as_deref(),
+                config.max_nested_archive_depth,
+            ),
+            tracing::info_span!("extract"),
         )
         .await;
         extracted_archives = processed_archives;
@@ -542,14 +772,18 @@ async fn run_stages(
     // ------------------------------------------------------------------
     if unpack && pipeline_ok && config.cleanup_after_extract {
         let cleanup_root = config.output_dir.as_deref().unwrap_or(job_dir);
-        let result = run_cleanup_stage_with_rules(
-            job_dir,
-            cleanup_root,
-            &extracted_archives,
-            cleanup_patterns,
-            unwanted_extensions,
-            config.delete_archives,
-        );
+        let started = Instant::now();
+        let result = tracing::info_span!("cleanup").in_scope(|| {
+            run_cleanup_stage_with_rules(
+                job_dir,
+                cleanup_root,
+                &extracted_archives,
+                cleanup_patterns,
+                unwanted_extensions,
+                config.delete_archives,
+            )
+        });
+        record_stage("cleanup", started.elapsed().as_secs_f64());
         stages.push(result);
     }
 
@@ -821,6 +1055,7 @@ async fn run_extract_stage(
 
     if !extracted_any {
         info!("No archives found — skipping extraction");
+        record_stage("extract", start.elapsed().as_secs_f64());
         return (
             StageResult {
                 name: "Extract".to_string(),
@@ -833,6 +1068,7 @@ async fn run_extract_stage(
         );
     }
 
+    record_stage("extract", start.elapsed().as_secs_f64());
     (
         StageResult {
             name: "Extract".to_string(),
@@ -1003,6 +1239,7 @@ fn run_cleanup_stage_with_rules(
         StageStatus::Failed
     };
 
+    record_stage("extract_cleanup", start.elapsed().as_secs_f64());
     StageResult {
         name: "Cleanup".to_string(),
         status,
